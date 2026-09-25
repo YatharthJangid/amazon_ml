@@ -37,11 +37,11 @@ class CharNgramIndex:
         self.floor = floor
         self.batch = batch
         self.vec = TfidfVectorizer(analyzer="char_wb", ngram_range=ngram, dtype=np.float32)
-        self.ids: List[str] = []
+        self.ids = np.array([])
         self.mat = None
 
     def fit(self, ids: List[str], texts: List[str]):
-        self.ids = list(ids)
+        self.ids = np.array(ids)
         safe_texts = [t if (t and str(t).strip()) else " " for t in texts]
         self.mat = self.vec.fit_transform(safe_texts)
         return self
@@ -50,19 +50,31 @@ class CharNgramIndex:
         if self.mat is None or len(self.ids) == 0:
             return [[] for _ in texts]
         res = []
-        for i in range(0, len(texts), self.batch):
-            batch_texts = [t if (t and str(t).strip()) else " " for t in texts[i : i + self.batch]]
-            q = self.vec.transform(batch_texts)
-            sim = (q @ self.mat.T).toarray()
-            k = min(self.topk, sim.shape[1])
-            if k == 0:
-                res.extend([[] for _ in batch_texts])
-                continue
-            idx = np.argpartition(-sim, k - 1, axis=1)[:, :k]
-            for r in range(idx.shape[0]):
-                row_cols = idx[r]
-                valid_cols = row_cols[sim[r, row_cols] > self.floor]
-                res.append([self.ids[c] for c in valid_cols])
+        q_mat = self.vec.transform([t if (t and str(t).strip()) else " " for t in texts])
+        for i in range(0, q_mat.shape[0], self.batch):
+            q_batch = q_mat[i : i + self.batch]
+            sim_batch = q_batch.dot(self.mat.T)  # Sparse dot product
+            
+            # Iterate sparse rows directly - NO .toarray()!
+            for row_idx in range(sim_batch.shape[0]):
+                row = sim_batch.getrow(row_idx)
+                if row.nnz == 0:
+                    res.append([])
+                    continue
+                
+                cols = row.indices
+                data = row.data
+                mask = data > self.floor
+                valid_cols = cols[mask]
+                valid_data = data[mask]
+                
+                if len(valid_data) == 0:
+                    res.append([])
+                    continue
+                
+                # Get top K
+                top_k_idx = np.argsort(-valid_data)[:self.topk]
+                res.append(self.ids[valid_cols[top_k_idx]].tolist())
         return res
 
 

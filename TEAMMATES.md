@@ -119,6 +119,15 @@ All source code lives in [`code/business_entity_resolution/src/`](file:///home/j
   - `matching_results.tsv`: `source1_entity_id\tmatched_entity_ids`
 - Both files must have exactly 2 tab-separated columns, all test S1 IDs must appear, and `matching_results ⊆ candidate_pairs`.
 
+### Decision 9: Offline Preprocessing & Parquet Caching (`preprocess.py`)
+- **Why:** In raw TSVs, normalizing strings and evaluating regexes on-the-fly inside the 66M candidate pair loop caused severe lag and thrashing.
+- **Decision:** Shift compute from $O(N \times C)$ to $O(N)$. Precompute canonical features (`norm_name`, `norm_addr`, `sort_name`, `sort_addr`, `norm_name_tokens`, `norm_addr_tokens`, `postal`, `postal_3`, `st_num`, `acronym`, `script_indic`, `script_ascii`) once per record via Polars + `multiprocessing` across CPU threads, and stream directly to compressed Parquet files (`dataset/cache/*.parquet`) with PyArrow.
+- **Impact:** Peak RAM during preprocessing stays strictly under 3 GB, and Parquet loading takes < 2 seconds.
+
+### Decision 10: Sparse Row Iteration in Blocking (Zero-OOM)
+- **Why:** Running `.toarray()` on a $(1024 \times 6,000,000)$ TF-IDF similarity matrix created a 24.6 GB dense NumPy array per batch, causing kernel memory crashes on 10 GB RAM machines.
+- **Decision:** In `blocking.py`, `CharNgramIndex.query()` iterates sparse rows directly using `sim_batch.getrow(row_idx)` and sparse array slicing. No dense `.toarray()` allocations ever occur.
+
 ---
 
 ## 5. Daily Submission Discipline (Max 5/Day per Team)
