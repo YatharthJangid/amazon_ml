@@ -22,7 +22,7 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 from normalize import normalize_name, normalize_addr
-from blocking import BlockingEngine, blocking_recall
+from blocking import CountryPartitionedBlocker, blocking_recall
 from features import extract_pair_features
 from scoring import score_pair, tune_threshold
 from evaluate import macro_f05, report_f05
@@ -93,27 +93,34 @@ def run_pipeline(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Resolve source paths
-    s1_path = data_dir / f"{split}_source1.tsv"
-    s2_path = data_dir / f"{split}_source2.tsv"
-    s3_path = data_dir / f"{split}_source3.tsv"
-    gt_path = data_dir / f"{split}_ground_truth.tsv"
+    # 1. Resolve source paths (handles flat or train/test subfolders)
+    def resolve_file(d: Path, fname: str) -> Path:
+        if (d / fname).exists():
+            return d / fname
+        if (d / split / fname).exists():
+            return d / split / fname
+        return d / fname
 
-    print("Loading source TSVs...")
+    s1_path = resolve_file(data_dir, f"{split}_source1.tsv")
+    s2_path = resolve_file(data_dir, f"{split}_source2.tsv")
+    s3_path = resolve_file(data_dir, f"{split}_source3.tsv")
+    gt_path = resolve_file(data_dir, f"{split}_ground_truth.tsv")
+
+    print(f"Loading source TSVs from: {s1_path.parent}...")
     s1_records = canonicalize(load_source_tsv(s1_path))
     s2_records = canonicalize(load_source_tsv(s2_path))
     s3_records = canonicalize(load_source_tsv(s3_path))
-    print(f"Loaded: S1={len(s1_records)}, S2={len(s2_records)}, S3={len(s3_records)} records")
+    print(f"Loaded: S1={len(s1_records):,}, S2={len(s2_records):,}, S3={len(s3_records):,} records")
 
     # Combine S2 + S3 into unified candidate target catalog
     target_catalog = s2_records + s3_records
     target_map = {r["id"]: r for r in target_catalog}
 
-    # 2. Candidate Blocking
-    print("\nIndexing candidate catalog and generating candidate pairs...")
-    engine = BlockingEngine()
+    # 2. Candidate Blocking using CountryPartitionedBlocker
+    print("\nIndexing candidate catalog by country and generating candidate pairs...")
+    engine = CountryPartitionedBlocker()
     engine.index_catalog(target_catalog)
-    candidate_pairs_map = engine.generate_candidates(s1_records, max_candidates_per_query=60)
+    candidate_pairs_map = engine.generate_candidates(s1_records, max_candidates_per_query=30)
 
     # In train mode, compute and print blocking recall ceiling
     if gt_path.exists():

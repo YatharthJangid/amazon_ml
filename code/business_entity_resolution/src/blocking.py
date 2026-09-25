@@ -244,3 +244,49 @@ class BlockingEngine:
             results[qid] = ordered_cand
 
         return results
+
+
+from features import norm_country
+
+
+class CountryPartitionedBlocker:
+    """Partitions the candidate catalog by country to eliminate cross-country noise and save RAM."""
+    def __init__(self):
+        self.blockers: Dict[str, BlockingEngine] = {}
+        self.countries_seen: Set[str] = set()
+
+    def index_catalog(self, records: List[Dict[str, Any]]):
+        by_country = defaultdict(list)
+        for r in records:
+            c = norm_country(r.get("country", "UNKNOWN"))
+            by_country[c].append(r)
+            self.countries_seen.add(c)
+
+        for country, recs in by_country.items():
+            print(f"  -> Indexing {len(recs):,} targets for country: {country}...")
+            eng = BlockingEngine()
+            eng.index_catalog(recs)
+            self.blockers[country] = eng
+
+    def generate_candidates(
+        self, query_records: List[Dict[str, Any]], max_candidates_per_query: int = 30
+    ) -> Dict[str, List[str]]:
+        results: Dict[str, List[str]] = {}
+        by_country = defaultdict(list)
+        for r in query_records:
+            c = norm_country(r.get("country", "UNKNOWN"))
+            by_country[c].append(r)
+
+        for country, recs in by_country.items():
+            eng = self.blockers.get(country)
+            if not eng:
+                print(f"  -> [WARNING] Country {country} not in catalog index. Setting empty candidates.")
+                for r in recs:
+                    results[r["id"]] = []
+                continue
+
+            print(f"  -> Generating candidates for {len(recs):,} queries in country: {country}...")
+            cands = eng.generate_candidates(recs, max_candidates_per_query=max_candidates_per_query)
+            results.update(cands)
+
+        return results
