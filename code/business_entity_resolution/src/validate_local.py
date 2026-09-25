@@ -1,20 +1,47 @@
 """
 Local Submission Validator.
 Enforces all competition format and consistency rules:
-1. Exactly 2 tab-separated columns per file.
-2. Every test S1 ID appears exactly once.
-3. No duplicate rows, no duplicate candidate/match IDs within a row.
-4. All matched and candidate IDs start with S2- or S3- and exist in test catalogs.
-5. matching_results is a strict subset of candidate_pairs per entity.
+1. Exactly 2 tab-separated columns per submission file.
+2. Official headers:
+   - matching_results.tsv:  source1_entity_id \t matched_entity_ids
+   - candidate_pairs.tsv:   source1_entity_id \t candidate_entity_ids
+3. Every test S1 ID appears exactly once.
+4. No duplicate rows, no duplicate candidate/match IDs within a row.
+5. All matched and candidate IDs start with S2- or S3- and exist in test catalogs.
+6. matching_results is a strict subset of candidate_pairs per entity.
 """
 
 import sys
 from pathlib import Path
-from typing import Set, Dict, List, Tuple
+from typing import Set, Dict, List, Tuple, Optional
 
 
-def parse_tsv_file(path: Path) -> Tuple[List[str], Dict[str, List[str]]]:
-    """Parses a 2-column TSV into an ordered list of keys and a mapping of id -> list of matches."""
+def load_source_ids(path: Path) -> List[str]:
+    """Extracts entity IDs from a source TSV (first column or entity_id)."""
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    ids = []
+    with open(path, "r", encoding="utf-8") as f:
+        header_line = f.readline().rstrip("\r\n")
+        headers = header_line.split("\t")
+        id_idx = 0
+        for i, h in enumerate(headers):
+            if h.lower() in ("entity_id", "source1_entity_id", "source2_entity_id", "source3_entity_id", "id"):
+                id_idx = i
+                break
+
+        for line in f:
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) > id_idx:
+                val = parts[id_idx].strip()
+                if val:
+                    ids.append(val)
+    return ids
+
+
+def parse_submission_tsv(path: Path) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Parses a 2-column submission TSV into an ordered list of keys and a mapping of id -> list of matches."""
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
@@ -35,7 +62,7 @@ def parse_tsv_file(path: Path) -> Tuple[List[str], Dict[str, List[str]]]:
         parts = line.split("\t")
         if len(parts) > 2:
             raise ValueError(f"Line {idx} in {path} has more than 2 tab-separated columns: {len(parts)}")
-        
+
         s1_id = parts[0].strip()
         matches_str = parts[1].strip() if len(parts) > 1 else ""
 
@@ -46,9 +73,7 @@ def parse_tsv_file(path: Path) -> Tuple[List[str], Dict[str, List[str]]]:
             raise ValueError(f"Duplicate S1 ID '{s1_id}' detected at line {idx} in {path}")
 
         if matches_str:
-            # Comma-separated list of candidate / matched IDs
             id_list = [item.strip() for item in matches_str.split(",") if item.strip()]
-            # Check for duplicate IDs inside list
             if len(id_list) != len(set(id_list)):
                 raise ValueError(f"Duplicate candidate IDs inside row for '{s1_id}' at line {idx} in {path}")
         else:
@@ -75,11 +100,11 @@ def validate_submission(
     print("=" * 60)
 
     # 1. Parse both submission files
-    match_keys, match_dict = parse_tsv_file(matching_tsv)
-    cand_keys, cand_dict = parse_tsv_file(candidates_tsv)
+    match_keys, match_dict = parse_submission_tsv(matching_tsv)
+    cand_keys, cand_dict = parse_submission_tsv(candidates_tsv)
 
     # 2. Parse ground truth test S1 IDs
-    expected_s1_keys, _ = parse_tsv_file(test_s1_tsv)
+    expected_s1_keys = load_source_ids(test_s1_tsv)
     expected_s1_set = set(expected_s1_keys)
 
     # Check that all expected S1 keys are present
@@ -117,11 +142,9 @@ def validate_submission(
     # 4. Check ID prefixes and catalog membership if S2/S3 paths provided
     valid_target_ids: Set[str] = set()
     if test_s2_tsv and test_s2_tsv.exists():
-        s2_keys, _ = parse_tsv_file(test_s2_tsv)
-        valid_target_ids.update(s2_keys)
+        valid_target_ids.update(load_source_ids(test_s2_tsv))
     if test_s3_tsv and test_s3_tsv.exists():
-        s3_keys, _ = parse_tsv_file(test_s3_tsv)
-        valid_target_ids.update(s3_keys)
+        valid_target_ids.update(load_source_ids(test_s3_tsv))
 
     for s1_id, c_list in cand_dict.items():
         for cid in c_list:
