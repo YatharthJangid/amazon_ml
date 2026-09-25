@@ -1,0 +1,11 @@
+dataset/
+*.tsv
+!tests/data/*.tsv
+weights/
+.venv/
+__pycache__/
+*.pt
+runs/
+output/
+.DS_Store
+*.log
