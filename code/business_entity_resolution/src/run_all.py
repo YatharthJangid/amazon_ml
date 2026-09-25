@@ -5,6 +5,9 @@ Fully compliant with official competition specification:
 - Writes official submission headers:
   candidate_pairs.tsv:  source1_entity_id \t candidate_entity_ids
   matching_results.tsv: source1_entity_id \t matched_entity_ids
+- Candidate Blocking with CountryPartitionedBlocker (US, India, France)
+- Multithreaded feature extraction (ThreadPoolExecutor, releases GIL)
+- Memory-safe streaming export to features.parquet (PyArrow ParquetWriter)
 - Evaluates candidate blocking recall ceiling (target >= 0.98)
 - Comprehensive multi-signal scoring via scoring.py
 - Validates format compliance via validate_local.py
@@ -13,8 +16,9 @@ Fully compliant with official competition specification:
 import os
 import sys
 import argparse
+import concurrent.futures
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 # Ensure local imports work cleanly
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -27,6 +31,19 @@ from features import extract_pair_features
 from scoring import score_pair, tune_threshold
 from evaluate import macro_f05, report_f05
 from validate_local import validate_submission
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 SPEC_ALIASES: Dict[str, str] = {
     "entity_id": "id",
@@ -82,13 +99,17 @@ def run_pipeline(
     data_dir: Path,
     output_dir: Path,
     split: str = "test",
-    threshold: float = 0.55,
+    threshold: float = 0.50,
+    max_candidates: int = 30,
+    max_workers: int = 8,
 ):
     print("=" * 75)
     print(f"🚀 RUNNING BUSINESS ENTITY RESOLUTION PIPELINE ({split.upper()} MODE)")
     print(f"Data directory:   {data_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Threshold:        {threshold}")
+    print(f"Workers:          {max_workers}")
+    print(f"Max candidates:   {max_candidates}")
     print("=" * 75)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -120,12 +141,14 @@ def run_pipeline(
     print("\nIndexing candidate catalog by country and generating candidate pairs...")
     engine = CountryPartitionedBlocker()
     engine.index_catalog(target_catalog)
-    candidate_pairs_map = engine.generate_candidates(s1_records, max_candidates_per_query=30)
+    candidate_pairs_map = engine.generate_candidates(s1_records, max_candidates_per_query=max_candidates)
 
     # In train mode, compute and print blocking recall ceiling
+    gt_map = None
     if gt_path.exists():
-        gt = load_ground_truth(gt_path)
-        recall_ceiling = blocking_recall(candidate_pairs_map, gt)
+        raw_gt = load_ground_truth(gt_path)
+        gt_map = {k: set(v) for k, v in raw_gt.items()}
+        recall_ceiling = blocking_recall(candidate_pairs_map, raw_gt)
         print("=" * 60)
         print(f"🎯 CANDIDATE BLOCKING RECALL CEILING: {recall_ceiling * 100:.2f}%")
         print("=" * 60)
@@ -140,14 +163,17 @@ def run_pipeline(
             f.write(f"{qid}\t{','.join(cands)}\n")
     print(f"✓ Wrote candidates to: {cand_out_path}")
 
-    # 3. Scoring & Matching Selection
-    print("\nScoring candidate pairs and applying decision threshold...")
-    matching_map: Dict[str, List[str]] = {}
-    scored_pairs = []
+    # 3. Multithreaded Feature Extraction + Streaming Parquet Export
+    print(f"\nExtracting pairwise features (Multithreaded: {max_workers} workers)...")
+    feat_path = output_dir / "features.parquet"
+    parquet_writer = None
+    batch_buffer: List[Dict[str, Any]] = []
+    BATCH_FLUSH = 100_000
 
-    for r in s1_records:
+    def process_query(r: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Tuple[str, List[str]]]:
         qid = r["id"]
         cands = candidate_pairs_map.get(qid, [])
+        local_pairs = []
         matched_cands = []
 
         for cid in cands:
@@ -157,12 +183,58 @@ def run_pipeline(
 
             feats = extract_pair_features(r, target_rec)
             score = score_pair(feats)
-            scored_pairs.append((qid, cid, score))
 
             if score >= threshold:
                 matched_cands.append(cid)
 
-        matching_map[qid] = matched_cands
+            feats["s1_id"] = qid
+            feats["target_id"] = cid
+            feats["score"] = float(score)
+
+            if gt_map is not None:
+                feats["label"] = 1.0 if cid in gt_map.get(qid, set()) else 0.0
+            else:
+                feats["label"] = -1.0
+
+            local_pairs.append(feats)
+
+        return local_pairs, (qid, matched_cands)
+
+    matching_map: Dict[str, List[str]] = {}
+    total_pairs = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        iterator = executor.map(process_query, s1_records)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, total=len(s1_records), desc="Extracting Features")
+
+        for local_pairs, (qid, matched) in iterator:
+            matching_map[qid] = matched
+            if local_pairs:
+                batch_buffer.extend(local_pairs)
+                total_pairs += len(local_pairs)
+
+            if len(batch_buffer) >= BATCH_FLUSH:
+                if HAS_PYARROW:
+                    table = pa.Table.from_pylist(batch_buffer)
+                    if parquet_writer is None:
+                        parquet_writer = pq.ParquetWriter(feat_path, table.schema, compression="snappy")
+                    parquet_writer.write_table(table)
+                batch_buffer.clear()
+
+    # Flush remaining batch buffer
+    if batch_buffer and HAS_PYARROW:
+        table = pa.Table.from_pylist(batch_buffer)
+        if parquet_writer is None:
+            parquet_writer = pq.ParquetWriter(feat_path, table.schema, compression="snappy")
+        parquet_writer.write_table(table)
+        batch_buffer.clear()
+
+    if parquet_writer is not None:
+        parquet_writer.close()
+        print(f"✓ Saved {total_pairs:,} total feature rows to: {feat_path} (Snappy compressed)")
+    else:
+        print(f"✓ Processed {total_pairs:,} total candidate pairs.")
 
     # Write matching_results.tsv with exact spec headers
     match_out_path = output_dir / "matching_results.tsv"
@@ -185,31 +257,36 @@ def run_pipeline(
     )
 
     # 5. Optional Evaluation against Ground Truth (if available)
-    if gt_path.exists():
+    if gt_map is not None:
         print("\nEvaluating against Ground Truth...")
         all_s1 = [r["id"] for r in s1_records]
-        macro_score = macro_f05(gt, matching_map, all_s1_ids=all_s1)
-        rep = report_f05(gt, matching_map, all_s1_ids=all_s1)
+        raw_gt = load_ground_truth(gt_path)
+        macro_score = macro_f05(raw_gt, matching_map, all_s1_ids=all_s1)
+        rep = report_f05(raw_gt, matching_map, all_s1_ids=all_s1)
         print("=" * 60)
         print(f"🏆 VALIDATION MACRO F0.5 SCORE (at threshold {threshold:.2f}): {macro_score:.4f}")
         print(f"   Singleton Accuracy:         {rep['singleton_accuracy']:.4f} ({rep['singleton_count']} entities)")
         print(f"   Matched Entities F0.5:       {rep['matched_macro_f05']:.4f} ({rep['matched_count']} entities)")
         print("=" * 60)
 
-        # Threshold sweep on validation set
-        print("\nRunning Threshold Sweep:")
-        best_t, best_s = tune_threshold(scored_pairs, gt, all_s1, lo=0.30, hi=0.85, step=0.05)
-        print(f" Optimal threshold for current features: {best_t:.2f} (Macro F0.5: {best_s:.4f})")
-
     print("\n Pipeline execution completed successfully!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run full entity resolution pipeline")
-    parser.add_argument("--data_dir", type=Path, default=Path("tests/data"), help="Directory containing source TSVs")
+    parser.add_argument("--data_dir", type=Path, default=Path("dataset/train"), help="Directory containing source TSVs")
     parser.add_argument("--output_dir", type=Path, default=Path("output"), help="Output directory for predictions")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="Dataset split to evaluate")
-    parser.add_argument("--threshold", type=float, default=0.55, help="Decision threshold")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "test"], help="Dataset split to evaluate")
+    parser.add_argument("--threshold", type=float, default=0.50, help="Decision threshold")
+    parser.add_argument("--max_candidates", type=int, default=30, help="Max candidates per entity")
+    parser.add_argument("--max_workers", type=int, default=8, help="Number of worker threads")
     args = parser.parse_args()
 
-    run_pipeline(args.data_dir, args.output_dir, args.split, args.threshold)
+    run_pipeline(
+        args.data_dir,
+        args.output_dir,
+        args.split,
+        args.threshold,
+        args.max_candidates,
+        args.max_workers,
+    )
