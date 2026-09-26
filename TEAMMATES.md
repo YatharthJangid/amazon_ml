@@ -262,4 +262,4 @@ Every single submission must be logged in our shared tracking sheet before hitti
 |---|---|---|---|---|
 | 02 | 26 Sep 21:17 | v3 per-state blocking + LGBM, th 0.70 | 0.9745 | **0.960** |
 | 03 | 26 Sep 23:30 | + French legal-form categories | 0.9745 | **0.965** |
-| 04 | 27 Sep | + name-swap features, France regions, St/Saint | 0.9747 | _fill in_ |
+| 04 | 27 Sep 00:50 | + name-swap features, France regions, St/Saint | 0.9747 | **0.967** |
