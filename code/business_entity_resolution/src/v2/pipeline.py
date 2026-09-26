@@ -62,12 +62,17 @@ def stage_prep(data: Path, work: Path):
     json.dump(tr, open(work / "translit.json", "w"), ensure_ascii=False)
     del pos, s1, tg; gc.collect()
     for name, p in raw.items():
+        import pyarrow.parquet as pq
         raw = read_tsv(p)
-        df = pl.concat([add_hashes(add_tokens(raw.slice(s, 500_000), tr)) for s in range(0, raw.height, 500_000)])
-        del raw
-        df.write_parquet(work / f"{name}.tok.parquet")
-        log(f"prep {name}: {df.height:,} rows")
-        del df; gc.collect()
+        out, w = work / f"{name}.tok.parquet", None
+        for s in range(0, raw.height, 300_000):     # stream chunks to disk: bounded memory
+            ch = add_hashes(add_tokens(raw.slice(s, 300_000), tr)).to_arrow()
+            if w is None:
+                w = pq.ParquetWriter(out, ch.schema)
+            w.write_table(ch.cast(w.schema)); del ch; gc.collect()
+        w.close()
+        log(f"prep {name}: {raw.height:,} rows")
+        del raw; gc.collect()
 
 
 # ------------------------------------------------------------------------------ 2. block
