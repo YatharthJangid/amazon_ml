@@ -186,3 +186,67 @@ Every single submission must be logged in our shared tracking sheet before hitti
        --test_s3 dataset/test_source3.tsv
    ```
 6. **Submit Sub #1 (Baseline) to confirm zero format errors.**
+
+---
+
+## 7. v2 pipeline — decisions log (Shaivi + Claude, 26 Sep)
+
+### Decision 11: Replace char-n-gram TF-IDF blocking (it cannot finish at this scale)
+- **Measured:** one S1 address query has non-zero char-n-gram cosine with **96 %** of catalog rows. A 1024-query batch against the 6.2M US targets produces ~6 billion sparse entries (~75 GB). It either runs out of memory or takes ~70 h.
+- **Decision:** new `v2/block.py` `MultiBlocker`, which is linear-time.
+  - Each record → hashed tokens in two channels:
+    - **name**: legal-stripped word tokens, the glued name, and char 4-grams of the glued name (typos, `greenimpex.com`, `#servicesblue`)
+    - **address**: tokens and adjacent bigrams (`1795_westchester`)
+  - Per-country IDF. Tokens with document frequency > 2000 (name) / 3000 (address) are dropped from the index, which bounds cost per query.
+  - Score = `cos_name + cos_addr`, computed as chunked sparse matmul (Q @ Tᵀ). Pairs below 0.25 are dropped before ranking.
+
+### Decision 12: Reverse top-1 (target → best S1) in blocking
+- **Data fact:** in train, every S2/S3 record belongs to **at most one** S1 (7,638,365 pairs, 7,638,365 unique targets).
+- Forward top-K alone plateaus (~91 % India) because generic names ("Dream Investments" ×20 in other cities) crowd out the true match. Adding each target's best S1 fixes most of it.
+- **Final candidate set = forward top-10 ∪ reverse top-1 → ~10.5 candidates/S1.** The organisers rank smaller candidate sets higher.
+
+### Decision 13: State-conflict penalty
+- True pairs **never** disagree on state in US (0.00004 %) and rarely in India (1.1 %).
+- State names, 2-letter codes and native-script forms (महाराष्ट्र, MH, Maharashtra) are all mapped to one `_st_xx` token, stored as a 128-bit mask.
+- A pair whose known states don't intersect gets −0.6 before ranking.
+
+### Decision 14: Indic-script handling learned from training data
+- 13–23 % of India target names are in Indic scripts. Position-aligned name pairs in train give a 1,328-entry token dictionary (रियल→real, प्राइवेट→private …). Residual non-Latin names drop to ~1 %.
+- This uses the provided training data only, so it's fair-play compliant.
+
+### Decision 15: Matcher = LightGBM on 53 vectorised features + one-S1-per-target assignment
+- rapidfuzz `process.cpdist` (C++, multi-threaded): 18.6M test pairs featurised in ~4 min.
+- **Key finding:** most false positives are *planted decoys*. These are copies of a real business with only the legal form changed (Private↔Public, Pvt Ltd↔LLP) or one house number changed (82/2C**5** vs 82/2C**16**).
+  - Legal-form category features (`lg_*`, `lg_conflict`) and digit-run features (`dig_*`) became top features.
+  - Together they took India OOF from 0.954 to 0.970.
+- Name-ambiguity counts: how many S1s / targets share the exact name key.
+- No country feature is used, so the model transfers to France (unseen).
+- Decision: each target goes to its highest-probability S1, only if p ≥ 0.70 (OOF-tuned). An expected-F0.5 per-S1 optimiser gave no gain, so it was dropped.
+
+### Results (train, GroupKFold by S1, 150k S1/country)
+| | India | US |
+|---|---|---|
+| Blocking recall @ ~10.5 cands/S1 | 95.4 % | 96.6 % |
+| Ceiling (perfect matcher on these candidates) | ~0.985 | ~0.988 |
+| **OOF macro F0.5** | **0.970** | **0.973** |
+
+### Submission log
+| Sub # | Date/time | Pipeline | Local CV F0.5 | Public LB |
+|---|---|---|---|---|
+| 01 | 26 Sep ~10:30 | v2 blocking (fwd10+rev1) + LGBM 53 feats, th 0.70 | 0.9717 | _fill in_ |
+
+### Decision 16 (v3 blocking): per-state partitions + whole-component state detection
+- **Bug found:** state names were replaced anywhere in the address, so "306 **Massachusetts** Avenue, Cherokee, OK" got two states and broke the state logic. Now a state is only recognised when a whole comma-separated address part is a state name, a code, or a native-script state name.
+- **Bug found:** token rarity (IDF, df-cap) was computed nation-wide, so street names and house numbers that are distinctive *within a state* were dropped. Blocking now runs **per (country, state) partition**. Targets without a detected state (~3.5 %) join every partition, and partitions are merged with global re-ranking.
+- Score now rewards having both kinds of evidence: `cos_name + cos_addr + 0.5·min(cos_name, cos_addr)`.
+- Recall at the same ~10.3 cands/S1: **US 96.6 % → 98.4 %**, India 95.4 % → 95.9 %.
+- Memory: partitions are written to disk and merged in numpy in the parent process. This avoids OOM on 7–8 GB machines.
+
+### Results v3 (train OOF, GroupKFold, 150k S1/country)
+| | India | US | overall |
+|---|---|---|---|
+| OOF macro F0.5 | 0.970 | 0.979 | 0.9745 |
+
+| Sub # | Date/time | Pipeline | Local CV F0.5 | Public LB |
+|---|---|---|---|---|
+| 02 | 26 Sep ~19:45 | v3 per-state blocking + LGBM 53 feats, th 0.70 | 0.9745 | _fill in_ |
