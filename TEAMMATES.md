@@ -250,3 +250,16 @@ Every single submission must be logged in our shared tracking sheet before hitti
 | Sub # | Date/time | Pipeline | Local CV F0.5 | Public LB |
 |---|---|---|---|---|
 | 02 | 26 Sep ~19:45 | v3 per-state blocking + LGBM 53 feats, th 0.70 | 0.9745 | _fill in_ |
+
+### Decision 17 (France): legal-form categories, name-word swaps, regions
+- Public LB of sub02 was **0.960** vs 0.9745 US/India CV. France (no labels, ~15 % of test) was the drag.
+- **French legal forms each get their own category** (SARL, SAS, SASU, EURL, SA, SCI, EI, SNC; dotted forms like "S.A.S." too). Before, they were one bucket, so SARL→SAS decoys looked consistent. In train, pairs whose legal forms differ are true matches only 0.6 % of the time. → **sub03: 0.965** (France-only change).
+- **Name-word swap features** (`nk_unm_s1`, `nk_unm_t`, `nk_swap`): the count of name words with no fuzzy (≥80) partner on the other side. France decoys swap one type word ("Leducation Club" → "Leducation Ecole").
+- **France regions:** region names and their departments map to one code (Hauts-de-France / Nord / Pas-de-Calais; Nouvelle-Aquitaine / Gironde; Pays de la Loire / Loire-Atlantique), so France gets per-region blocking. "St"→"Saint" and "Ets"→"Etablissements" apply to France only.
+- US/India CV unchanged (0.9747).
+
+| Sub # | Date/time | Pipeline | Local CV F0.5 | Public LB |
+|---|---|---|---|---|
+| 02 | 26 Sep 21:17 | v3 per-state blocking + LGBM, th 0.70 | 0.9745 | **0.960** |
+| 03 | 26 Sep 23:30 | + French legal-form categories | 0.9745 | **0.965** |
+| 04 | 27 Sep | + name-swap features, France regions, St/Saint | 0.9747 | _fill in_ |

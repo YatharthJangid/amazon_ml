@@ -164,6 +164,16 @@ IN_COMP = {**{k: f"_st_{v}" for k, v in IN_STATES.items()}, **IN_CODES,
            "new delhi": "_st_dl", "nct of delhi": "_st_dl", "orissa": "_st_od"}
 
 
+# France: region names AND their departments (sources 2/3 often give the department) -> one region code,
+# so France gets per-region blocking like US states / Indian states.
+FR_COMP = {"hauts de france": "_st_fr_hdf", "nord": "_st_fr_hdf", "pas de calais": "_st_fr_hdf",
+           "nouvelle aquitaine": "_st_fr_naq", "gironde": "_st_fr_naq",
+           "pays de la loire": "_st_fr_pdl", "loire atlantique": "_st_fr_pdl"}
+# France-specific abbreviations: "St-Nazaire" must meet "Saint-Nazaire" (not "street")
+FR_ABBR = {**ADDR_ABBR, "st": "saint", "ste": "sainte", "sts": "saints"}
+FR_NAME = {"ets": "etablissements", "st": "saint", "ste": "sainte", "sté": "societe", "ste.": "societe"}
+
+
 def address_tokens(df: pl.DataFrame, translit: dict) -> pl.DataFrame:
     """Address -> token list, with STATE detected only as a whole comma-separated component
     (so '306 Massachusetts Avenue' is a street, while ', Massachusetts' / ', MA' is a state).
@@ -179,6 +189,7 @@ def address_tokens(df: pl.DataFrame, translit: dict) -> pl.DataFrame:
     joined = pl.col("toks").list.join(" ")
     st_whole = (pl.when(pl.col("country") == "US").then(joined.replace_strict(US_COMP, default=None))
                   .when(pl.col("country") == "India").then(joined.replace_strict(IN_COMP, default=None))
+                  .when(pl.col("country") == "France").then(joined.replace_strict(FR_COMP, default=None))
                   .otherwise(pl.lit(None, pl.String)))
     uq = pl.col("toks").list.unique()
     st_native = pl.when((uq.list.len() == 1) & uq.list.first().str.starts_with("_st_")).then(uq.list.first())
@@ -199,7 +210,10 @@ def add_tokens(df: pl.DataFrame, translit: dict) -> pl.DataFrame:
         ntok_all=map_tokens(pl.col("nm_raw"), translit),
         atok=at["atok"],
     ).drop("nm_raw")
-    df = df.with_columns(atok=map_tokens(pl.col("atok"), ADDR_ABBR))
+    df = df.with_columns(atok=pl.when(pl.col("country") == "France")
+                         .then(map_tokens(pl.col("atok"), FR_ABBR)).otherwise(map_tokens(pl.col("atok"), ADDR_ABBR)))
+    df = df.with_columns(ntok_all=pl.when(pl.col("country") == "France")
+                         .then(map_tokens(pl.col("ntok_all"), FR_NAME)).otherwise(pl.col("ntok_all")))
     df = df.with_columns(
         ntok=pl.col("ntok_all").list.eval(pl.element().filter(~pl.element().is_in(list(LEGAL)))),
         nm=pl.col("ntok_all").list.join(" "),

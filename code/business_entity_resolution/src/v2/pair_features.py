@@ -27,12 +27,41 @@ def _cp(a, b, scorer, **kw):
     return process.cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32, **kw)
 
 
+# French legal forms get their OWN category each (mapped onto the existing category slots the model
+# learned from US/India), so a SARL -> SAS swap is seen as a legal-form conflict exactly like LLC -> Inc.
+# In train, pairs whose legal forms differ are true matches only 0.6 % of the time (planted decoys).
+_FR_RX = {  # regexes on the lower-cased, accent-stripped raw name; dots optional ("S.A.S.")
+    "sarl": r"\bs\.?\s?a\.?\s?r\.?\s?l\b", "sasu": r"\bs\.?a\.?s\.?u\b", "sas": r"\bs\.?a\.?s\b",
+    "sa": r"\bs\.?a\b", "eurl": r"\be\.?u\.?r\.?l\b", "sci": r"\bs\.?c\.?i\b", "ei": r"\be\.?i\b",
+    "snc": r"\bs\.?n\.?c\b",
+}
+_FR_SLOT = {"sarl": "llc", "sas": "inc", "sasu": "corp", "eurl": "pc", "sa": "ltd", "sci": "llp", "ei": "co", "snc": "pub"}
+
+
+def _legal_flags() -> dict:
+    """lg_<cat> presence flags. US/India: token lists per LEGAL_CATS. France: one slot per French form."""
+    raw = (pl.col("business_name").fill_null("").str.normalize("NFKD")
+             .str.replace_all(r"[\u0300-\u036f]", "").str.to_lowercase())
+    fr = {k: raw.str.contains(rx) for k, rx in _FR_RX.items()}
+    fr["sas"] = fr["sas"] & ~fr["sasu"]
+    fr["sa"] = fr["sa"] & ~fr["sas"] & ~fr["sasu"] & ~fr["sarl"]
+    is_fr = pl.col("country") == "France"
+    out = {}
+    for k, v in LEGAL_CATS.items():
+        default = pl.col("ntok_all").list.eval(pl.element().is_in(v)).list.any()
+        fr_slots = [f for f, slot in _FR_SLOT.items() if slot == k]
+        fr_flag = pl.any_horizontal([fr[f] for f in fr_slots]) if fr_slots else pl.lit(False)
+        out[f"lg_{k}"] = pl.when(is_fr).then(fr_flag).otherwise(default)
+    return out
+
+
 def record_view(df: pl.DataFrame) -> pl.DataFrame:
     """Per-record derived strings used by the pair features."""
     return df.select(
         "entity_id",
         nm=pl.col("ntok_all").list.join(" "),            # full cleaned name (translit applied)
         nk=pl.col("ntok").list.join(" "),                # legal-stripped key
+        ntok=pl.col("ntok"),
         ng=pl.col("ntok").list.join(""),                 # glued key (domains / hashtags)
         ad=pl.col("atok").list.join(" "),
         nums=pl.col("atok").list.eval(pl.element().filter(pl.element().str.contains(r"^\d+$"))),
@@ -45,9 +74,35 @@ def record_view(df: pl.DataFrame) -> pl.DataFrame:
         # every digit run in the raw address (keeps digits glued to letters: 2C16 -> 2, 16)
         dig=pl.col("business_address").fill_null("").str.extract_all(r"\d+")
             .list.eval(pl.element().str.replace(r"^0+(\d)", "$1")),
-        **{f"lg_{k}": pl.col("ntok_all").list.eval(pl.element().is_in(v)).list.any() for k, v in LEGAL_CATS.items()},
+        **_legal_flags(),
         a_len=pl.col("atok").list.len(),
     )
+
+
+def unmatched_tokens(n1: pl.Series, n2: pl.Series, cutoff: float = 80.0):
+    """For aligned token lists, count tokens of side 1 with no fuzzy (ratio >= cutoff) partner on
+    side 2, and vice versa. Vectorised: exact matches are removed with set ops, and only the few
+    leftover tokens are compared pairwise with rapidfuzz.cpdist."""
+    d = pl.DataFrame({"a": n1, "b": n2}).with_row_index("i")
+    d = d.with_columns(ua=pl.col("a").list.set_difference("b"), ub=pl.col("b").list.set_difference("a"))
+    out = []
+    for left, right in (("ua", "b"), ("ub", "a")):
+        e = d.select("i", tok=pl.col(left)).explode("tok").drop_nulls("tok")
+        if e.height == 0:
+            out.append(np.zeros(d.height, np.int32)); continue
+        o = d.select("i", other=pl.col(right)).explode("other").drop_nulls("other")
+        x = e.with_row_index("k").join(o, on="i", how="left")
+        has = x["other"].is_not_null().to_numpy()
+        sim = np.zeros(x.height, np.float32)
+        if has.any():
+            xs = x.filter(pl.col("other").is_not_null())
+            sim[has] = _cp(xs["tok"].to_list(), xs["other"].to_list(), fuzz.ratio)
+        best = (x.with_columns(sim=pl.Series(sim)).group_by("k").agg(pl.col("i").first(), pl.col("sim").max())
+                  .filter(pl.col("sim") < cutoff).group_by("i").len("n"))
+        arr = np.zeros(d.height, np.int32)
+        arr[best["i"].to_numpy()] = best["n"].to_numpy()
+        out.append(arr)
+    return out[0], out[1]
 
 
 def name_counts(s1: pl.DataFrame, tg: pl.DataFrame) -> pl.DataFrame:
@@ -77,6 +132,9 @@ def pair_features(pairs: pl.DataFrame, s1v: pl.DataFrame, tv: pl.DataFrame, nkc:
     f["ad_tsort"] = _cp(a["ad_1"], a["ad_2"], fuzz.token_sort_ratio)
     f["ad_partial"] = _cp(a["ad_1"], a["ad_2"], fuzz.partial_ratio)
     del a
+    u1, u2 = unmatched_tokens(d["ntok_1"].fill_null([]), d["ntok_2"].fill_null([]))
+    f["nk_unm_s1"] = u1.astype(np.float32); f["nk_unm_t"] = u2.astype(np.float32)
+    f["nk_swap"] = ((u1 > 0) & (u2 > 0)).astype(np.float32)
     ds1 = d["dig_1"].list.join(" ").fill_null("").to_list()
     ds2 = d["dig_2"].list.join(" ").fill_null("").to_list()
     f["dig_ratio"] = _cp(ds1, ds2, fuzz.ratio)
@@ -121,4 +179,4 @@ FEATURES = ["sc", "cn", "ca", "fwd_rank", "rev_rank", "nm_ratio", "nk_ratio", "n
             "ad_partial", "num1_eq", "nums_jacc", "nums_in", "st_eq", "a_null_2", "n_nonlatin_2",
             "n_domain_2", "n_len_1", "n_len_2", "a_len_1", "a_len_2", "is_s3", "n_cand",
             "sc_gap_s1", "sc_gap_t", "n_s1_for_t", "dig_jacc", "dig_t_extra", "dig_s_extra", "dig_n2",
-            "dig_ratio", "lg_conflict", "nk1_cnt_s1", "nk1_cnt_t", "nk2_cnt_s1", "nk2_cnt_t"] + [f"lg_{k}" for k in LEGAL_CATS]
+            "dig_ratio", "lg_conflict", "nk1_cnt_s1", "nk1_cnt_t", "nk2_cnt_s1", "nk2_cnt_t", "nk_unm_s1", "nk_unm_t", "nk_swap"] + [f"lg_{k}" for k in LEGAL_CATS]
